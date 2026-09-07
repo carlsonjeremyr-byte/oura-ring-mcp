@@ -99,6 +99,7 @@ const mockRefreshAccessToken = vi.fn();
 vi.mock("./auth/store.js", () => ({
   loadCredentials: mockLoadCredentials,
   isExpired: mockIsExpired,
+  saveCredentials: vi.fn(),
 }));
 
 vi.mock("./auth/oauth.js", () => ({
@@ -116,6 +117,13 @@ vi.mock("./auth/cli.js", () => ({
   runLogout: mockRunLogout,
   showAuthStatus: mockShowAuthStatus,
 }));
+
+/** The OuraClient now receives a token manager; resolve the token it would use. */
+async function resolvedToken(): Promise<string> {
+  const config = MockOuraClient.lastConfig as { tokenManager: { getAccessToken(): Promise<string> } };
+  expect(config.tokenManager).toBeDefined();
+  return config.tokenManager.getAccessToken();
+}
 
 describe("MCP Server", () => {
   const originalEnv = process.env;
@@ -162,7 +170,7 @@ describe("MCP Server", () => {
 
       await import("./index.js");
 
-      expect(MockOuraClient.lastConfig).toEqual({ accessToken: "test-token" });
+      expect(await resolvedToken()).toBe("test-token");
     });
 
     it("should accept OURA_PERSONAL_ACCESS_TOKEN as fallback", async () => {
@@ -171,7 +179,7 @@ describe("MCP Server", () => {
 
       await import("./index.js");
 
-      expect(MockOuraClient.lastConfig).toEqual({ accessToken: "personal-token" });
+      expect(await resolvedToken()).toBe("personal-token");
     });
 
     it("should prefer OURA_ACCESS_TOKEN over OURA_PERSONAL_ACCESS_TOKEN", async () => {
@@ -180,7 +188,7 @@ describe("MCP Server", () => {
 
       await import("./index.js");
 
-      expect(MockOuraClient.lastConfig).toEqual({ accessToken: "primary-token" });
+      expect(await resolvedToken()).toBe("primary-token");
     });
   });
 
@@ -202,7 +210,7 @@ describe("MCP Server", () => {
       await import("./index.js");
 
       expect(MockOuraClient.instances.length).toBe(1);
-      expect(MockOuraClient.lastConfig).toEqual({ accessToken: "my-oura-token" });
+      expect(await resolvedToken()).toBe("my-oura-token");
     });
 
     it("should register tools with server and client", async () => {
@@ -255,7 +263,7 @@ describe("MCP Server", () => {
       await import("./index.js");
 
       expect(mockLoadCredentials).toHaveBeenCalled();
-      expect(MockOuraClient.lastConfig).toEqual({ accessToken: "stored-token" });
+      expect(await resolvedToken()).toBe("stored-token");
     });
 
     it("should refresh expired token", async () => {
@@ -281,11 +289,12 @@ describe("MCP Server", () => {
 
       await import("./index.js");
 
+      // Refresh happens lazily, on first token use
+      expect(await resolvedToken()).toBe("refreshed-token");
       expect(mockRefreshAccessToken).toHaveBeenCalledWith(
         "refresh-token",
         expect.objectContaining({ clientId: "test-client" })
       );
-      expect(MockOuraClient.lastConfig).toEqual({ accessToken: "refreshed-token" });
     });
   });
 });

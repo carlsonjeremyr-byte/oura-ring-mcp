@@ -5,6 +5,7 @@
 
 import type { components } from "./types/oura-api.js";
 import { OuraApiError } from "./utils/errors.js";
+import type { OuraTokenManager } from "./auth/token-manager.js";
 
 const BASE_URL = "https://api.ouraring.com/v2/usercollection";
 
@@ -38,7 +39,10 @@ export type RingConfiguration = components["schemas"]["RingConfigurationModel"];
 export type SleepTime = components["schemas"]["SleepTimeModel"];
 
 export interface OuraClientConfig {
-  accessToken: string;
+  /** Static access token (legacy PAT or a token obtained elsewhere). */
+  accessToken?: string;
+  /** Token manager that refreshes OAuth tokens automatically. Preferred. */
+  tokenManager?: OuraTokenManager;
 }
 
 // Generic response wrapper from Oura API
@@ -49,9 +53,11 @@ export interface OuraResponse<T> {
 
 export class OuraClient {
   private accessToken: string;
+  private tokenManager?: OuraTokenManager;
 
   constructor(config: OuraClientConfig) {
-    this.accessToken = config.accessToken;
+    this.accessToken = config.accessToken ?? "";
+    this.tokenManager = config.tokenManager;
   }
 
   /**
@@ -59,6 +65,20 @@ export class OuraClient {
    */
   setAccessToken(token: string): void {
     this.accessToken = token;
+  }
+
+  /**
+   * Attach a token manager (OAuth auto-refresh)
+   */
+  setTokenManager(manager: OuraTokenManager): void {
+    this.tokenManager = manager;
+  }
+
+  private async resolveToken(): Promise<string> {
+    if (this.tokenManager) {
+      return this.tokenManager.getAccessToken();
+    }
+    return this.accessToken;
   }
 
   private async fetch<T>(
@@ -73,11 +93,22 @@ export class OuraClient {
       });
     }
 
-    const response = await fetch(url.toString(), {
-      headers: {
-        Authorization: `Bearer ${this.accessToken}`,
-      },
+    let token = await this.resolveToken();
+    let response = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${token}` },
     });
+
+    // On 401 with a token manager, refresh once and retry — covers tokens
+    // revoked server-side or expiry clock skew.
+    if (response.status === 401 && this.tokenManager) {
+      const refreshed = await this.tokenManager.forceRefresh();
+      if (refreshed) {
+        token = refreshed;
+        response = await fetch(url.toString(), {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+      }
+    }
 
     if (!response.ok) {
       const body = await response.text();

@@ -24,8 +24,7 @@ import { OuraClient } from "./client.js";
 import { registerTools } from "./tools/index.js";
 import { registerResources } from "./resources/index.js";
 import { registerPrompts } from "./prompts/index.js";
-import { loadCredentials, isExpired } from "./auth/store.js";
-import { refreshAccessToken, getOAuthConfigFromEnv } from "./auth/oauth.js";
+import { OuraTokenManager } from "./auth/token-manager.js";
 
 // Read version from package.json
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -64,85 +63,47 @@ if (["auth", "logout", "status"].includes(command)) {
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Get access token from environment or stored credentials
- * Handles token refresh if expired
+ * Credential precedence:
+ *   1. Stored OAuth credentials (auto-refreshed; persisted to OURA_CREDENTIALS_PATH)
+ *   2. OURA_ACCESS_TOKEN env var (legacy Personal Access Token — deprecated by Oura)
  *
- * Returns null if no token is found (HTTP mode can start without one)
+ * HTTP mode can start with neither: the owner authorizes via GET /oauth/start.
  */
-async function getAccessToken(): Promise<string | null> {
-  // First priority: environment variable
-  const envToken = process.env.OURA_ACCESS_TOKEN || process.env.OURA_PERSONAL_ACCESS_TOKEN;
-  if (envToken) {
-    return envToken;
-  }
+const staticToken = process.env.OURA_ACCESS_TOKEN || process.env.OURA_PERSONAL_ACCESS_TOKEN;
+const tokenManager = new OuraTokenManager({ staticToken });
+await tokenManager.load();
 
-  // Second priority: stored OAuth credentials
-  const credentials = await loadCredentials();
-  if (!credentials) {
-    return null;
-  }
-
-  // Check if token needs refresh
-  if (isExpired(credentials)) {
-    const oauthConfig = getOAuthConfigFromEnv();
-    if (!oauthConfig) {
-      console.error(
-        "Warning: Token expired and cannot refresh without OAuth credentials.\n" +
-          "Please set OURA_CLIENT_ID and OURA_CLIENT_SECRET, or run:\n" +
-          "  npx oura-ring-mcp auth"
-      );
-      return null;
-    }
-
-    console.error("Access token expired, refreshing...");
-    try {
-      const refreshed = await refreshAccessToken(credentials.refresh_token, oauthConfig);
-      console.error("Token refreshed successfully.");
-      return refreshed.access_token;
-    } catch (error) {
-      console.error(
-        `Token refresh failed: ${error instanceof Error ? error.message : error}\n` +
-          "Please re-authenticate: npx oura-ring-mcp auth"
-      );
-      return null;
-    }
-  }
-
-  return credentials.access_token;
-}
-
-// ─────────────────────────────────────────────────────────────
-// Server Setup
-// ─────────────────────────────────────────────────────────────
-
-const accessToken = await getAccessToken();
-
-// For stdio transport, a token is required upfront
-if (!accessToken && !useHttpTransport) {
+if (!tokenManager.hasCredentials() && !useHttpTransport) {
   console.error(
     "Error: No Oura credentials found.\n\n" +
-      "Option 1: Set OURA_ACCESS_TOKEN environment variable\n" +
-      "  Get your token at: https://cloud.ouraring.com/personal-access-tokens\n\n" +
-      "Option 2: Authenticate via OAuth\n" +
+      "Authenticate via OAuth (Personal Access Tokens are no longer issued by Oura):\n" +
       "  Run: npx oura-ring-mcp auth\n" +
       "  (Requires OURA_CLIENT_ID and OURA_CLIENT_SECRET)"
   );
   process.exit(1);
 }
 
-if (!accessToken && useHttpTransport) {
+if (!tokenManager.hasCredentials() && useHttpTransport) {
   console.error(
-    "Warning: No Oura credentials found. Server will start but API calls will fail.\n" +
-      "Set OURA_ACCESS_TOKEN environment variable to enable data access."
+    "Warning: No Oura credentials found. Server will start; authorize it by opening /oauth/start."
+  );
+} else if (tokenManager.status().mode === "static") {
+  console.error(
+    "Warning: Using OURA_ACCESS_TOKEN (Personal Access Token). Oura has deprecated PATs — " +
+      "set OURA_CLIENT_ID/OURA_CLIENT_SECRET and authorize via /oauth/start (HTTP) or `auth` (CLI)."
   );
 }
+
+// ─────────────────────────────────────────────────────────────
+// Server Setup
+// ─────────────────────────────────────────────────────────────
 
 const server = new McpServer({
   name: "oura-mcp",
   version: VERSION,
 });
 
-const ouraClient = new OuraClient({ accessToken: accessToken ?? "" });
+const ouraClient = new OuraClient({ tokenManager });
 
 // Register all tools, resources, and prompts with the server
 registerTools(server, ouraClient);
@@ -157,7 +118,7 @@ async function main() {
   if (useHttpTransport) {
     // HTTP transport for remote deployment
     const { startHttpServer } = await import("./transports/http.js");
-    await startHttpServer(server, { ouraClient });
+    await startHttpServer(server, { ouraClient, tokenManager });
   } else {
     // Stdio transport for local use (Claude Desktop)
     const transport = new StdioServerTransport();
