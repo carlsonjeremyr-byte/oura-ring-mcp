@@ -35,13 +35,13 @@ npx oura-ring-mcp
 
 ### 2. Authenticate with Oura
 
-**Option A: Personal Access Token (simpler)**
+> **Personal Access Tokens are deprecated.** Oura no longer issues new PATs and existing ones will be shut off. `OURA_ACCESS_TOKEN` still works as a fallback until then, but use OAuth.
 
-1. Go to [cloud.ouraring.com/personal-access-tokens](https://cloud.ouraring.com/personal-access-tokens)
-2. Create a new token
-3. Set `OURA_ACCESS_TOKEN` in your Claude Desktop config (see below)
+**Option A: Personal Access Token (legacy)**
 
-**Option B: OAuth CLI Flow**
+If you still have a working PAT, set `OURA_ACCESS_TOKEN` in your Claude Desktop config (see below). No new tokens can be created.
+
+**Option B: OAuth CLI Flow (recommended)**
 
 1. Create an OAuth app at [developer.ouraring.com](https://developer.ouraring.com/applications)
    - Set Redirect URI to `http://localhost:3000/callback`
@@ -211,10 +211,18 @@ In the Railway dashboard, add:
 | `OURA_CLIENT_ID` | From your Oura OAuth app |
 | `OURA_CLIENT_SECRET` | From your Oura OAuth app |
 | `NODE_ENV` | `production` |
-| `MCP_SECRET` | *(Optional)* Static bearer token for Claude Desktop (`openssl rand -base64 32`) |
-| `OURA_ACCESS_TOKEN` | *(Optional)* PAT fallback if not using OAuth (`MCP_SECRET` required) |
+| `MCP_SECRET` | *(Optional)* Static bearer token for Claude Desktop (`openssl rand -base64 32`). Also protects `/oauth/start`. |
+| `OURA_CREDENTIALS_PATH` | *(Recommended)* Where Oura tokens are stored, e.g. `/data/credentials.json` on a mounted volume |
+| `OAUTH_STATE_PATH` | *(Recommended)* Where MCP client registrations/tokens are stored, e.g. `/data/oauth-state.json` |
+| `OURA_ACCESS_TOKEN` | *(Legacy)* PAT fallback — deprecated by Oura, only used when no OAuth credentials are stored |
 
 Railway automatically sets `PORT` and `RAILWAY_PUBLIC_DOMAIN`.
+
+**Add a volume.** Oura refresh tokens are single-use, so the server must persist them across redeploys. In Railway: service → *Volumes* → add a volume mounted at `/data`, then set the two `*_PATH` variables above to files under `/data`. Without a volume, every redeploy logs the server out of Oura and you must re-authorize.
+
+### 3b. Authorize the server with Oura
+
+Open `https://your-app.railway.app/oauth/start?key=<MCP_SECRET>` in a browser (omit `?key=` if you didn't set `MCP_SECRET`), sign in to Oura, and approve. The server stores the tokens and refreshes them automatically from then on. `GET /health` reports the auth mode (`oauth`, `static`, or `none`). Repeat this any time the credentials are lost or revoked.
 
 ### 4. Connect from Claude.ai
 
@@ -226,7 +234,7 @@ Use the **connector** in Claude.ai:
 
 ### 5. Connect from Claude Desktop
 
-For Claude Desktop, use `MCP_SECRET` + `OURA_ACCESS_TOKEN`:
+For Claude Desktop, use `MCP_SECRET` (after authorizing the server via `/oauth/start`):
 
 ```json
 {
@@ -247,8 +255,8 @@ For Claude Desktop, use `MCP_SECRET` + `OURA_ACCESS_TOKEN`:
 # With Oura OAuth (full flow)
 OURA_CLIENT_ID=your_id OURA_CLIENT_SECRET=your_secret pnpm start:http
 
-# With static secret only (requires OURA_ACCESS_TOKEN)
-OURA_ACCESS_TOKEN=your_pat MCP_SECRET=test-secret pnpm start:http
+# With static secret (authorize once via http://localhost:3000/oauth/start?key=test-secret)
+OURA_CLIENT_ID=your_id OURA_CLIENT_SECRET=your_secret MCP_SECRET=test-secret pnpm start:http
 
 # Verify health endpoint
 curl http://localhost:3000/health

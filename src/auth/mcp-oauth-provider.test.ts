@@ -164,12 +164,13 @@ describe("OuraMcpOAuthProvider", () => {
       });
 
       // Step 3: Handle Oura callback
-      const redirectUrl = await provider.handleOuraCallback(
+      const result = await provider.handleOuraCallback(
         "oura-auth-code",
         ouraState
       );
 
-      const url = new URL(redirectUrl);
+      expect(result.kind).toBe("redirect");
+      const url = new URL((result as { kind: "redirect"; url: string }).url);
       expect(url.origin).toBe("https://claude.ai");
       expect(url.pathname).toBe("/callback");
       expect(url.searchParams.get("code")).toBeDefined();
@@ -213,7 +214,14 @@ describe("OuraMcpOAuthProvider", () => {
 
       await providerWithCallback.handleOuraCallback("code", ouraState);
 
-      expect(onOuraTokens).toHaveBeenCalledWith("oura-token", "oura-refresh");
+      expect(onOuraTokens).toHaveBeenCalledWith(
+        expect.objectContaining({
+          access_token: "oura-token",
+          refresh_token: "oura-refresh",
+          token_type: "bearer",
+          expires_at: expect.any(Number),
+        })
+      );
     });
 
     it("should throw for invalid state", async () => {
@@ -294,11 +302,9 @@ describe("OuraMcpOAuthProvider", () => {
       });
 
       // 3. Handle callback (get our auth code)
-      const clientRedirectUrl = await provider.handleOuraCallback(
-        "oura-code",
-        ouraState
-      );
-      const ourCode = new URL(clientRedirectUrl).searchParams.get("code")!;
+      const callback = await provider.handleOuraCallback("oura-code", ouraState);
+      if (callback.kind !== "redirect") throw new Error("expected redirect");
+      const ourCode = new URL(callback.url).searchParams.get("code")!;
 
       // 4. Exchange our code for tokens
       const tokens = await provider.exchangeAuthorizationCode(client, ourCode);
@@ -481,6 +487,7 @@ async function getAuthCodeViaOuraCallback(
   } as globalThis.Response);
 
   // Handle callback
-  const redirectUrl = await provider.handleOuraCallback("oura-code", ouraState);
-  return new URL(redirectUrl).searchParams.get("code")!;
+  const callback = await provider.handleOuraCallback("oura-code", ouraState);
+  if (callback.kind !== "redirect") throw new Error("expected redirect");
+  return new URL(callback.url).searchParams.get("code")!;
 }

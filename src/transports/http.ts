@@ -14,8 +14,12 @@
  *   POST /token                                     — Token exchange
  *   POST /revoke                                    — Token revocation
  *
- * Custom route:
+ * Custom routes:
+ *   GET  /oauth/start    — Server-owner (re)authorization with Oura (browser)
  *   GET  /oauth/callback — Handles Oura's redirect after user authorizes
+ *
+ * Oura credentials (access + single-use refresh token) are persisted via the
+ * token manager and refreshed automatically before every API call.
  */
 import express, { Request, Response } from "express";
 import { randomUUID } from "node:crypto";
@@ -28,6 +32,8 @@ import {
   type OuraMcpOAuthProviderOptions,
 } from "../auth/mcp-oauth-provider.js";
 import type { OuraClient } from "../client.js";
+import type { OuraTokenManager } from "../auth/token-manager.js";
+import { timingSafeEqual } from "node:crypto";
 
 // ─────────────────────────────────────────────────────────────
 // Types
@@ -42,6 +48,15 @@ export interface HttpTransportOptions {
   stateless?: boolean;
   /** OuraClient instance to update when OAuth tokens are obtained */
   ouraClient?: OuraClient;
+  /** Token manager that persists/refreshes Oura credentials */
+  tokenManager?: OuraTokenManager;
+}
+
+function secretsMatch(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  return ab.length === bb.length && timingSafeEqual(ab, bb);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -70,6 +85,7 @@ export async function startHttpServer(
   const secret = options.secret ?? process.env.MCP_SECRET;
   const stateless = options.stateless ?? true;
   const ouraClient = options.ouraClient;
+  const tokenManager = options.tokenManager;
 
   const baseUrl = resolveBaseUrl(port);
 
@@ -110,7 +126,11 @@ export async function startHttpServer(
 
   // Health check endpoint (no auth required)
   app.get("/health", (_req, res) => {
-    res.json({ status: "ok", service: "oura-mcp" });
+    res.json({
+      status: "ok",
+      service: "oura-mcp",
+      oura: tokenManager ? tokenManager.status() : undefined,
+    });
   });
 
   // ── OAuth Setup ──────────────────────────────────────────
@@ -147,15 +167,20 @@ export async function startHttpServer(
       ouraClientId: ouraClientId!,
       ouraClientSecret: ouraClientSecret!,
       staticSecret: secret,
-      onOuraTokens: (accessToken, _refreshToken) => {
-        if (ouraClient) {
-          ouraClient.setAccessToken(accessToken);
+      statePath: process.env.OAUTH_STATE_PATH,
+      onOuraTokens: async (credentials) => {
+        if (tokenManager) {
+          await tokenManager.setCredentials(credentials);
+          console.error("Oura credentials saved; token manager updated");
+        } else if (ouraClient) {
+          ouraClient.setAccessToken(credentials.access_token);
           console.error("OuraClient updated with new OAuth token");
         }
       },
     };
 
     const oauthProvider = new OuraMcpOAuthProvider(providerOptions);
+    await oauthProvider.loadState();
 
     // Mount OAuth endpoints (metadata, authorize, token, register, revoke)
     // resourceServerUrl is set to baseUrl (root) so Claude.ai can find
@@ -170,6 +195,17 @@ export async function startHttpServer(
         scopesSupported: [],
       })
     );
+
+    // Direct (re)authorization for the server owner. Protected by MCP_SECRET
+    // (?key=...) when one is configured, since completing it rebinds the
+    // server's Oura identity.
+    app.get("/oauth/start", (req: Request, res: Response) => {
+      if (secret && !secretsMatch(req.query.key as string | undefined, secret)) {
+        res.status(401).send("Missing or invalid key. Use /oauth/start?key=<MCP_SECRET>.");
+        return;
+      }
+      res.redirect(302, oauthProvider.buildDirectAuthorizationUrl());
+    });
 
     // Oura OAuth callback — handles redirect from Oura after user authorizes
     app.get("/oauth/callback", async (req: Request, res: Response) => {
@@ -195,9 +231,20 @@ export async function startHttpServer(
           return;
         }
 
-        // Exchange Oura code and redirect to MCP client
-        const redirectUrl = await oauthProvider.handleOuraCallback(code, state);
-        res.redirect(302, redirectUrl);
+        // Exchange Oura code, then either redirect to the MCP client or
+        // confirm a direct authorization
+        const result = await oauthProvider.handleOuraCallback(code, state);
+        if (result.kind === "direct") {
+          res.send(
+            `<html><body style="font-family:system-ui;padding:2rem">
+              <h2>Oura connected</h2>
+              <p>The server is authorized and will refresh its token automatically.</p>
+              <p>You can close this window.</p>
+            </body></html>`
+          );
+          return;
+        }
+        res.redirect(302, result.url);
       } catch (err) {
         console.error("OAuth callback error:", err);
         res.status(500).send(
@@ -359,6 +406,15 @@ export async function startHttpServer(
         `OAuth metadata: GET /.well-known/oauth-authorization-server`
       );
       console.error(`Oura callback: GET /oauth/callback`);
+      console.error(`Owner re-authorization: GET /oauth/start${secret ? "?key=<MCP_SECRET>" : ""}`);
+    }
+    if (tokenManager) {
+      const s = tokenManager.status();
+      console.error(
+        s.mode === "none"
+          ? "No Oura credentials yet — open /oauth/start to authorize."
+          : `Oura auth mode: ${s.mode}${s.canRefresh ? " (auto-refresh on)" : ""}`
+      );
     }
   });
 }
