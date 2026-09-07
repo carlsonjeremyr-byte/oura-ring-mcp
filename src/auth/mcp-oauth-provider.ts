@@ -21,7 +21,10 @@
  * bearer token (requires OURA_ACCESS_TOKEN env var for API calls).
  */
 import { randomUUID, randomBytes } from "node:crypto";
+import { promises as fs } from "node:fs";
+import { dirname } from "node:path";
 import { Response } from "express";
+import type { OuraCredentials } from "./store.js";
 import type {
   OAuthServerProvider,
   AuthorizationParams,
@@ -65,6 +68,20 @@ interface PendingAuth {
   state?: string;
   scopes: string[];
   createdAt: number;
+  /** Direct (browser-initiated) authorization: no MCP client to redirect back to */
+  direct?: boolean;
+}
+
+/** Result of handling Oura's callback */
+export type OuraCallbackResult =
+  | { kind: "redirect"; url: string }
+  | { kind: "direct" };
+
+/** Persisted provider state (so a restart doesn't log Claude.ai out) */
+interface PersistedState {
+  clients: [string, OAuthClientInformationFull][];
+  accessTokens: [string, TokenEntry][];
+  refreshTokens: [string, RefreshTokenEntry][];
 }
 
 interface AuthCodeEntry {
@@ -103,7 +120,13 @@ export interface OuraMcpOAuthProviderOptions {
   /** Optional static secret for backward compat (MCP_SECRET) */
   staticSecret?: string;
   /** Called when new Oura tokens are obtained via OAuth */
-  onOuraTokens?: (accessToken: string, refreshToken: string) => void;
+  onOuraTokens?: (credentials: OuraCredentials) => void | Promise<void>;
+  /**
+   * Optional JSON file for persisting registered clients and issued tokens.
+   * Without it, every restart invalidates Claude.ai's connector tokens and the
+   * user has to reconnect.
+   */
+  statePath?: string;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -121,7 +144,8 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
   private ouraClientSecret: string;
   private callbackUrl: string;
   private staticSecret: string | undefined;
-  private onOuraTokens?: (accessToken: string, refreshToken: string) => void;
+  private onOuraTokens?: (credentials: OuraCredentials) => void | Promise<void>;
+  private statePath?: string;
 
   constructor(options: OuraMcpOAuthProviderOptions) {
     this.ouraClientId = options.ouraClientId;
@@ -129,6 +153,44 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
     this.callbackUrl = new URL("/oauth/callback", options.baseUrl).toString();
     this.staticSecret = options.staticSecret;
     this.onOuraTokens = options.onOuraTokens;
+    this.statePath = options.statePath;
+  }
+
+  // ── State Persistence ──────────────────────────────────────
+
+  /** Load persisted clients/tokens (call once at startup). */
+  async loadState(): Promise<void> {
+    if (!this.statePath) return;
+    try {
+      const raw = await fs.readFile(this.statePath, "utf-8");
+      const state = JSON.parse(raw) as PersistedState;
+      this.clients = new Map(state.clients ?? []);
+      this.accessTokens = new Map(state.accessTokens ?? []);
+      this.refreshTokens = new Map(state.refreshTokens ?? []);
+      // Drop expired access tokens
+      const now = Math.floor(Date.now() / 1000);
+      for (const [token, entry] of this.accessTokens) {
+        if (entry.expiresAt < now) this.accessTokens.delete(token);
+      }
+      console.error(
+        `OAuth state loaded: ${this.clients.size} client(s), ${this.refreshTokens.size} refresh token(s)`
+      );
+    } catch {
+      // No state yet — fine
+    }
+  }
+
+  private saveState(): void {
+    if (!this.statePath) return;
+    const state: PersistedState = {
+      clients: [...this.clients],
+      accessTokens: [...this.accessTokens],
+      refreshTokens: [...this.refreshTokens],
+    };
+    const path = this.statePath;
+    fs.mkdir(dirname(path), { recursive: true })
+      .then(() => fs.writeFile(path, JSON.stringify(state), { mode: 0o600 }))
+      .catch((err) => console.error(`Failed to persist OAuth state: ${err}`));
   }
 
   // ── Client Registration Store ──────────────────────────────
@@ -154,6 +216,7 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
           client_id_issued_at: Math.floor(Date.now() / 1000),
         };
         self.clients.set(clientId, client);
+        self.saveState();
         console.error(`OAuth client registered: ${clientId}`);
         return client;
       },
@@ -191,13 +254,37 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
     res.redirect(302, ouraAuthUrl.toString());
   }
 
+  // ── Direct Authorization (browser → Oura → server) ────────
+  // Lets the server owner (re)authorize with Oura without an MCP client in
+  // the loop, e.g. after tokens were lost. Used by GET /oauth/start.
+
+  buildDirectAuthorizationUrl(): string {
+    const ouraState = randomUUID();
+    this.pendingAuths.set(ouraState, {
+      clientId: "direct",
+      codeChallenge: "",
+      redirectUri: "",
+      scopes: [],
+      createdAt: Date.now(),
+      direct: true,
+    });
+
+    const ouraAuthUrl = new URL(OURA_AUTHORIZE_URL);
+    ouraAuthUrl.searchParams.set("response_type", "code");
+    ouraAuthUrl.searchParams.set("client_id", this.ouraClientId);
+    ouraAuthUrl.searchParams.set("redirect_uri", this.callbackUrl);
+    ouraAuthUrl.searchParams.set("scope", OURA_SCOPES.join(" "));
+    ouraAuthUrl.searchParams.set("state", ouraState);
+    return ouraAuthUrl.toString();
+  }
+
   // ── Oura Callback Handler ─────────────────────────────────
   // Called by the /oauth/callback route when Oura redirects back
 
   async handleOuraCallback(
     ouraCode: string,
     ouraState: string
-  ): Promise<string> {
+  ): Promise<OuraCallbackResult> {
     // Look up the pending authorization
     const pending = this.pendingAuths.get(ouraState);
     if (!pending) {
@@ -215,9 +302,13 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
     // Exchange Oura's auth code for Oura tokens
     const ouraTokens = await this.exchangeOuraCode(ouraCode);
 
-    // Notify the server to update the OuraClient with the new token
+    // Notify the server to persist the credentials and update the OuraClient
     if (this.onOuraTokens) {
-      this.onOuraTokens(ouraTokens.access_token, ouraTokens.refresh_token);
+      await this.onOuraTokens(ouraTokens);
+    }
+
+    if (pending.direct) {
+      return { kind: "direct" };
     }
 
     // Generate our own auth code for the MCP client (Claude.ai)
@@ -237,7 +328,7 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
       redirectUrl.searchParams.set("state", pending.state);
     }
 
-    return redirectUrl.toString();
+    return { kind: "redirect", url: redirectUrl.toString() };
   }
 
   // ── Code Challenge Retrieval ───────────────────────────────
@@ -298,7 +389,8 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
     // Rotate refresh token
     this.refreshTokens.delete(refreshToken);
 
-    return this.issueTokenPair(client.client_id, scopes || entry.scopes);
+    const pair = this.issueTokenPair(client.client_id, scopes || entry.scopes);
+    return pair;
   }
 
   // ── Token Verification ─────────────────────────────────────
@@ -306,10 +398,14 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     // Check static secret first (backward compat with MCP_SECRET)
     if (this.staticSecret && token === this.staticSecret) {
+      // The SDK's bearer middleware rejects AuthInfo without expiresAt
+      // ("Token has no expiration time"), so give the static secret a
+      // far-future expiry.
       return {
         token,
         clientId: "static-secret",
         scopes: [],
+        expiresAt: Math.floor(Date.now() / 1000) + 365 * 24 * 3600,
       };
     }
 
@@ -339,6 +435,7 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
   ): Promise<void> {
     this.accessTokens.delete(request.token);
     this.refreshTokens.delete(request.token);
+    this.saveState();
   }
 
   // ── Private Helpers ────────────────────────────────────────
@@ -357,6 +454,7 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
       clientId,
       scopes,
     });
+    this.saveState();
 
     return {
       access_token: accessToken,
@@ -369,10 +467,7 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
   /**
    * Exchange an Oura authorization code for Oura access/refresh tokens
    */
-  private async exchangeOuraCode(code: string): Promise<{
-    access_token: string;
-    refresh_token: string;
-  }> {
+  private async exchangeOuraCode(code: string): Promise<OuraCredentials> {
     const response = await fetch(OURA_TOKEN_URL, {
       method: "POST",
       headers: {
@@ -405,6 +500,8 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
     return {
       access_token: data.access_token,
       refresh_token: data.refresh_token,
+      token_type: data.token_type,
+      expires_at: Date.now() + data.expires_in * 1000,
     };
   }
 }

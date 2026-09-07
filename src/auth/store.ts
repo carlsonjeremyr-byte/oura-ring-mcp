@@ -5,10 +5,17 @@
 
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 
-const CONFIG_DIR = join(homedir(), ".oura-mcp");
-const CREDENTIALS_FILE = join(CONFIG_DIR, "credentials.json");
+/**
+ * Credentials location. Override with OURA_CREDENTIALS_PATH (e.g. a file on a
+ * mounted Railway volume such as /data/credentials.json) so tokens survive
+ * redeploys — Oura refresh tokens are single-use, so losing the file means
+ * re-authorizing.
+ */
+function credentialsFile(): string {
+  return process.env.OURA_CREDENTIALS_PATH || join(homedir(), ".oura-mcp", "credentials.json");
+}
 
 export interface OuraCredentials {
   access_token: string;
@@ -21,7 +28,7 @@ export interface OuraCredentials {
  * Ensure the config directory exists
  */
 async function ensureConfigDir(): Promise<void> {
-  await fs.mkdir(CONFIG_DIR, { recursive: true });
+  await fs.mkdir(dirname(credentialsFile()), { recursive: true });
 }
 
 /**
@@ -30,7 +37,7 @@ async function ensureConfigDir(): Promise<void> {
  */
 export async function loadCredentials(): Promise<OuraCredentials | null> {
   try {
-    const data = await fs.readFile(CREDENTIALS_FILE, "utf-8");
+    const data = await fs.readFile(credentialsFile(), "utf-8");
     const credentials = JSON.parse(data) as OuraCredentials;
 
     // Validate required fields
@@ -51,7 +58,7 @@ export async function loadCredentials(): Promise<OuraCredentials | null> {
 export async function saveCredentials(credentials: OuraCredentials): Promise<void> {
   await ensureConfigDir();
   await fs.writeFile(
-    CREDENTIALS_FILE,
+    credentialsFile(),
     JSON.stringify(credentials, null, 2),
     { mode: 0o600 } // Read/write for owner only
   );
@@ -62,7 +69,7 @@ export async function saveCredentials(credentials: OuraCredentials): Promise<voi
  */
 export async function clearCredentials(): Promise<void> {
   try {
-    await fs.unlink(CREDENTIALS_FILE);
+    await fs.unlink(credentialsFile());
   } catch {
     // File doesn't exist, that's fine
   }
@@ -79,5 +86,5 @@ export function isExpired(credentials: OuraCredentials, bufferMs = 60000): boole
  * Get the credentials file path (for display to user)
  */
 export function getCredentialsPath(): string {
-  return CREDENTIALS_FILE;
+  return credentialsFile();
 }
